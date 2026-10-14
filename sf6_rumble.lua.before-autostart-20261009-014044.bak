@@ -1,0 +1,169 @@
+-- SF6 Rumble prototype. Sources and limits: README_TR.md.
+-- No hooks, memory writes, ffi, MMDK installation or invented on_hit API.
+local old = rawget(_G, "SF6_RUMBLE_INSTANCE")
+if old then old.alive = false end
+local instance = {alive = true}
+_G.SF6_RUMBLE_INSTANCE = instance
+local enabled, incoming, outgoing = false, true, true
+local side, frames, serial, heartbeat = 1, 0, 0, 0
+local previous, categories, contexts = {}, {}, {}
+local events, last = {}, "No hit yet"
+local status, fault, pending = "Enable in offline Training", false, true
+local session = tostring(os.time()) .. ":" .. tostring(os.clock())
+local profiles = {
+    normal = {left=0.80, right=0.85, ms=150},
+    heavy  = {left=1.00, right=0.90, ms=230},
+    di     = {left=1.00, right=1.00, ms=300},
+    super  = {left=1.00, right=0.85, ms=400}
+}
+local function clear()
+    previous, categories, contexts = {}, {}, {}
+end
+local function emit(kind, detail)
+    serial = serial + 1
+    local p = profiles[kind]
+    events[#events+1] = {id=serial, kind=kind, left=p.left, right=p.right, ms=p.ms}
+    if #events > 32 then table.remove(events, 1) end
+    last = detail or kind
+    pending = true
+end
+local function publish(force_off)
+    heartbeat = heartbeat + 1
+    local ok, result = pcall(json.dump_file, "sf6_rumble_bus.json", {
+        version=1, session=session, heartbeat=heartbeat,
+        enabled=enabled and not force_off, events=events
+    }, -1)
+    if not ok or not result then status = "Cannot write reframework/data/sf6_rumble_bus.json" end
+    pending = false
+end
+local function bit(value, flag)
+    return math.floor(value / flag) % 2 == 1
+end
+local function class(flags)
+    if bit(flags, 65536) then return "di" end
+    if bit(flags, 32768) then return "super" end
+    if bit(flags, 64) then return "heavy" end
+    return "normal"
+end
+local function required_number(value, label)
+    local n = tonumber(value)
+    assert(n and n == n, "Missing/invalid " .. label)
+    return n
+end
+local function static_field(td, name)
+    local f = assert(td:get_field(name), "Missing gBattle." .. name)
+    return f:get_data(nil)
+end
+local function read_categories(command, index)
+    -- Exact access path used by MMDK PlayerData:new; category_flags is in
+    -- its trigger dumps. Only scalar results survive this callback.
+    local triggers = command:get_mUserEngine()[index]:call("GetTrigger()")
+    local map, count = {}, 0
+    for _, trigger in pairs(triggers) do
+        if trigger then
+            local id = required_number(trigger.action_id, "trigger.action_id")
+            local kind = class(required_number(trigger.category_flags, "trigger.category_flags"))
+            local rank = {normal=1, heavy=2, super=3, di=4}
+            if not map[id] or rank[kind] > rank[map[id]] then map[id] = kind end
+            count = count + 1
+        end
+    end
+    assert(count > 0, "Empty trigger table")
+    return map
+end
+local function sample()
+    local td = assert(sdk.find_type_definition("gBattle"), "gBattle not found")
+    local player = static_field(td, "Player")
+    if not player or required_number(player.prev_no_push_bit, "prev_no_push_bit") == 0 then
+        clear(); status = "Waiting for battle"; return
+    end
+    local command = assert(static_field(td, "Command"), "gBattle.Command not ready")
+    local snapshot = {}
+    for i=0,1 do
+        local p = assert(player.mcPlayer[i], "mcPlayer not ready")
+        local char = required_number(player.mPlayerType[i].mValue, "character ID")
+        local hp = required_number(p.vital_new, "vital_new")
+        local guard = required_number(p.guard_time, "guard_time")
+        local action = required_number(p.mpActParam.ActionPart._Engine:get_ActionID(), "ActionID")
+        snapshot[i] = {char=char, hp=hp, guard=guard, action=action}
+    end
+    -- Reset both sides on character change or healing/training/round reset.
+    local reset = false
+    for i=0,1 do
+        local now, prev = snapshot[i], previous[i]
+        if not prev or now.char ~= prev.char or now.hp > prev.hp then reset = true end
+    end
+    if reset then
+        categories, contexts = {}, {}
+        for i=0,1 do categories[i] = read_categories(command, i) end
+        previous = snapshot
+        status = "Battle data OK; baseline ready"
+        return
+    end
+    for i=0,1 do
+        local kind = categories[i][snapshot[i].action]
+        -- Carry Super across unclassified cinematic actions (at most 720 samples).
+        -- A classified non-Super action clears it. This is a heuristic, not a hit event.
+        if kind then
+            contexts[i] = {kind=kind, ttl=(kind == "super" and 720 or 2)}
+        elseif contexts[i] then
+            contexts[i].ttl = contexts[i].ttl - 1
+            if contexts[i].ttl <= 0 then contexts[i] = nil end
+        end
+    end
+    for victim=0,1 do
+        local now, prev = snapshot[victim], previous[victim]
+        local damage = prev.hp - now.hp
+        local attacker = 1-victim
+        local mine = side-1
+        if damage > 0 and now.guard <= 0 and
+           ((incoming and victim == mine) or (outgoing and attacker == mine)) then
+            local ctx = contexts[attacker]
+            local kind = ctx and ctx.kind or "normal"
+            emit(kind, string.format("%s | P%d -> P%d | HP -%d | action %d",
+                kind, attacker+1, victim+1, damage, snapshot[attacker].action))
+        end
+    end
+    previous = snapshot
+    status = "Battle data OK"
+end
+re.on_application_entry("UpdateBehavior", function()
+    if not instance.alive or not enabled or fault then return end
+    local ok, err = pcall(sample)
+    if not ok then
+        -- pcall catches Lua errors, not arbitrary native engine faults.
+        fault, enabled = true, false
+        clear(); events = {}; pending = true
+        status = "Stopped: " .. tostring(err)
+        log.error("SF6 Rumble: " .. tostring(err))
+    end
+end)
+re.on_frame(function()
+    if not instance.alive then return end
+    frames = frames + 1
+    if pending or frames % 6 == 0 then publish(false) end
+end)
+re.on_draw_ui(function()
+    if not instance.alive then return end
+    if imgui.tree_node("SF6 Rumble (experimental)") then
+        local changed
+        changed, enabled = imgui.checkbox("Enable (offline Training first)", enabled)
+        if changed then fault=false; clear(); events={}; pending=true end
+        changed, side = imgui.slider_int("My battle side (not XInput slot)", side, 1, 2)
+        if changed then clear() end
+        changed, incoming = imgui.checkbox("Rumble when I take damage", incoming)
+        changed, outgoing = imgui.checkbox("Rumble when I deal damage", outgoing)
+        imgui.text(status)
+        imgui.text(last)
+        imgui.text("XInput slot is selected in Start-Rumble.ps1 (0..3).")
+        for _, kind in ipairs({"normal", "heavy", "di", "super"}) do
+            if imgui.button("Test " .. kind) and enabled then emit(kind, "Manual test: " .. kind) end
+        end
+        if imgui.button("STOP") then enabled=false; clear(); events={}; pending=true end
+        imgui.tree_pop()
+    end
+end)
+re.on_script_reset(function()
+    if not instance.alive then return end
+    enabled=false; events={}; publish(true); instance.alive=false
+end)
